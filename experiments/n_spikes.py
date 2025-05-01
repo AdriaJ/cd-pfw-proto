@@ -20,7 +20,8 @@ def add_psnr(y0, psnr, N):
 if __name__ == '__main__':
     plot = False
 
-    n_spikes = np.arange(5, 95, 10)
+    # n_spikes = np.arange(5, 95, 10)
+    n_spikes = np.arange(5, 55, 10)
 
     duration = {"SFW": [], "SFW_PSO": [], "PFW": [], "Sliding_PFW": []}
     candidates_duration = {"SFW": [], "SFW_PSO": [], "PFW": [], "Sliding_PFW": []}

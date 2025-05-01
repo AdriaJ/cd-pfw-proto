@@ -66,9 +66,10 @@ class ConvolutionOperator(MyLinOp):
 
     def adjoint_function_grad(self, y: pxt.NDArray) -> Callable:
         def tmp(t):
-            w = self.outer_sub(t)
+            w = self.outer_sub(t)  # L, len(t), 2
+            # out = ((- w * self.kernel(w)[:,:,None] / self.sigma ** 2).T @ y).T
             out = ((w * self.kernel(w)[:,:,None] / self.sigma ** 2).T @ y).T
-            return out
+            return out  # len(t), 2
         return tmp
 
     def get_new_operator(self, x: pxt.NDArray) -> MyLinOp:
@@ -119,8 +120,8 @@ class DiffConvolutionOperator(MyLinOp):
             grid = np.linspace(bounds[0], bounds[1], self.n_measurements)
             grid = np.array(np.meshgrid(grid, grid)).T.reshape(-1, 2)
             self.grid = grid
-            self.n_measurements = self.n_measurements ** x_dim
-            self.outer_sub = lambda t: grid[:, None, :] - t.reshape(-1, x_dim)[None, :, :]
+            self.n_measurements = self.n_measurements ** x_dim  # L
+            self.outer_sub = lambda t: grid[:, None, :] - t.reshape(-1, x_dim)[None, :, :]  # (L, L, 2), with L = n**2
         else:
             raise ValueError("x_dim must be 1 or 2")
 
@@ -136,8 +137,8 @@ class DiffConvolutionOperator(MyLinOp):
     def grad_x(self, xa: pxt.NDArray) -> pxt.NDArray:
         a = np.split(xa, 1 + self.x_dim)[-1].reshape(-1, 1)
         x = xa[:-len(a)]
-        w = self.outer_sub(x)
-        tmp = (w * self.kernel(w)[:,:,None] / self.sigma ** 2).T.reshape(-1, self.n_measurements)
+        w = self.outer_sub(x)  # (L, L, 2)
+        tmp = (w * self.kernel(w)[:,:,None] / self.sigma ** 2).T.reshape(-1, self.n_measurements)  # (2L, L)
 
         if self.x_dim == 1:
             out = a * tmp
@@ -147,7 +148,7 @@ class DiffConvolutionOperator(MyLinOp):
             out[1::2] = a * tmp[len(tmp)//2:]
         else:
             raise ValueError("x_dim must be 1 or 2")
-        return out
+        return out  # (2L, L), well it seems ok
 
     def grad_a(self, xa: pxt.NDArray) -> pxt.NDArray:
         a = np.split(xa, 1 + self.x_dim)[-1]

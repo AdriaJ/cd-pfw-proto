@@ -18,6 +18,8 @@ from src.metrics.flat_norm import flat_norm
 from src.operators.dual_certificate import DualCertificate, SmoothDualCertificate
 from src.operators.my_lin_op import MyLinOp
 
+from joblib import Parallel, delayed, parallel_backend
+
 
 class FW(pxs.Solver):
     """
@@ -112,12 +114,18 @@ class FW(pxs.Solver):
 
         self.animation = options.get("animation", False) # Save the animation of the gradient descent
 
+        self.correction_eps = options.get("correction_eps", 1e-4) # RelErr threshold on the correstion steps
+        self.correction_max_iter = options.get("correction_max_iter", 100_000)
+
     def m_init(self, **kwargs):
         mst = self._mstate
 
         # Initialize the position and amplitude of the diracs
         mst["x"] = np.array([], dtype=np.float64)
         mst["a"] = np.array([], dtype=np.float64)
+
+        # Stop crit
+        mst["global_best_cost"] = np.inf  # needs to be larger than 1
 
         # Initialize of the metrics
         mst["candidates_search_durations"] = []
@@ -137,8 +145,17 @@ class FW(pxs.Solver):
     def swarm_init(self):
         mst = self._mstate
         # Initialize the particles and velocities
-        particles = np.random.uniform(low=self.bounds[0], high=self.bounds[1],
-                                      size=(self.n_particles, self.x_dim))
+        # particles = np.random.uniform(low=self.bounds[0], high=self.bounds[1],
+        #                               size=(self.n_particles, self.x_dim))
+        if self.x_dim == 1:
+            particles = np.linspace(self.bounds[0], self.bounds[1], self.n_particles+2)[1:-1].reshape((-1, 1))
+        elif self.x_dim == 2:
+            partperside = int(np.round(np.sqrt(self.n_particles)))
+            side_grid = np.linspace(self.bounds[0], self.bounds[1], partperside+2)[1:-1]
+            particles = np.stack(np.meshgrid(side_grid, side_grid)).T.reshape((-1, 2))
+        else:
+            raise ValueError("Particle initialization is only available for 1D and 2D signals.")
+
         mst['particles'] = particles
         mst['velocities'] = np.zeros((self.n_particles, self.x_dim))
 
@@ -210,6 +227,7 @@ class FW(pxs.Solver):
         n = int(n * max(self.bounds[1] - self.bounds[0], 1))
 
         # Initialize the particles
+        # start = time()
         if self.initialization == "random":
             mst['particles'] = np.random.uniform(low=self.bounds[0], high=self.bounds[1],
                                                  size=(self.n_particles, self.x_dim))
@@ -218,15 +236,15 @@ class FW(pxs.Solver):
                 mst['particles'] = np.linspace(self.bounds[0], self.bounds[1], n).reshape(-1, self.x_dim)
             elif self.x_dim == 2:
                 n = n // 2
-                grid1 = np.linspace(self.bounds[0], self.bounds[1], n + 1)[1:-1]
-                grid2 = np.linspace(self.bounds[0], self.bounds[1], n + 1)[1:-1]
+                grid1 = np.linspace(self.bounds[0], self.bounds[1], 2 * n + 1)[1:-1]
+                grid2 = np.linspace(self.bounds[0], self.bounds[1], 2 * n + 1)[1:-1]
                 xx, yy = np.meshgrid(grid1, grid2)
                 mst['particles'] = np.stack([xx.ravel(), yy.ravel()], axis=1)
             else:
                 raise ValueError("Grid initialization is only available for 1D and 2D signals.")
         elif self.initialization == "smoothing":
             if self.x_dim == 1:
-                grid = np.linspace(self.bounds[0], self.bounds[1], n * 5)
+                grid = np.linspace(self.bounds[0], self.bounds[1], n * 5)  # initially 5 was used, using less seem to help
             elif self.x_dim == 2:
                 grid1 = np.linspace(self.bounds[0], self.bounds[1], n * 2 + 1)[1:-1]
                 grid2 = np.linspace(self.bounds[0], self.bounds[1], n * 2 + 1)[1:-1]
@@ -242,39 +260,114 @@ class FW(pxs.Solver):
             mst["smooth_dual_certificate"].append((grid, smooth_dual_cert.z_smooth))
             mst["smooth_peaks"].append(mst['particles'])
             mst["n_candidates_smooth"].append(len(mst['particles']))
+        # print("Initialization time:", time() - start)
 
         dual_cert = DualCertificate(mst["x"], mst["a"], self.y, self.forward_op, self.lambda_, self.positive_constraint,
                                     self.x_dim)
 
-        x = np.random.uniform(low=self.bounds[0], high=self.bounds[1], size=(100, self.x_dim))
-        # Compute learning rate
-        for i in range(10):
-            x = dual_cert.grad(x)
-            x = x / np.linalg.norm(x)
-        learning_rate = 1 / (2 * np.linalg.norm(dual_cert.grad(x)) * self.forward_op.get_scaling())
+        def Gascent():
+            # start = time()
+            # Compute learning rate
+            x = np.random.uniform(low=self.bounds[0], high=self.bounds[1], size=(100, self.x_dim))
+            for i in range(10):
+                x = dual_cert.grad(x)
+                x = x / np.linalg.norm(x)
+            learning_rate = 1 / (2 * np.linalg.norm(dual_cert.grad(x)) * self.forward_op.get_scaling())
+            # print("Learning rate estimation time:", time() - start)
 
-        old_x = mst['particles'].copy()
+            old_x = mst['particles'].copy()
 
-        if self.animation:
-            all_particles = [mst['particles'].copy()]
-        for i in range(self.grad_max_iterations):
-
-            # Compute the gradient
-            grad = dual_cert.grad(mst['particles'])
-
-            # Update the particles
-            mst['particles'] += learning_rate * grad
-
-            # Enforce the bounds of the search space
-            mst['particles'] = np.clip(mst['particles'], self.bounds[0], self.bounds[1])
-
-            # Check convergence
-            current_x = mst['particles'].copy()
-            if np.allclose(current_x, old_x, atol=self.grad_tol) or np.linalg.norm(current_x - old_x) < self.grad_tol:
-                break
-            old_x = current_x
             if self.animation:
-                all_particles.append(mst['particles'].copy())
+                all_particles = [mst['particles'].copy()]
+
+            # start = time()
+            for i in range(self.grad_max_iterations):
+
+                # Compute the gradient
+                grad = dual_cert.grad(mst['particles'])
+
+                # Update the particles
+                mst['particles'] += learning_rate * grad
+
+                # Enforce the bounds of the search space
+                mst['particles'] = np.clip(mst['particles'], self.bounds[0], self.bounds[1])
+
+                # Check convergence
+                current_x = mst['particles'].copy()
+                if np.allclose(current_x, old_x, atol=self.grad_tol) or np.linalg.norm(current_x - old_x) < self.grad_tol:
+                    break
+                old_x = current_x
+                if self.animation:
+                    all_particles.append(mst['particles'].copy())
+            # print("Particle GD time:", time() - start)
+
+            # Animation of the gradient descent
+            if self._astate["idx"] == 1 and self.animation:
+                import matplotlib.animation as animation
+
+                n_iterations = len(all_particles)
+                fig, ax = plt.subplots()
+
+                x = np.linspace(self.bounds[0], self.bounds[1], 2048)
+                y = self.dual_certificate(x)
+                plt.plot(x, y, label='Empirical Dual Certificate', color='blue')
+
+                # Initialize the plot with the first point
+                xdata = all_particles[0].ravel()
+                ydata = self.dual_certificate(xdata)
+                scatter = ax.scatter(xdata, ydata, label='Gradient Steps')
+                x0 = np.array([0.2, 0.5, 0.8])
+                a0 = np.array([1, 2, 1.5])
+                ax.stem(x0, a0, linefmt='k.--', markerfmt='ko', basefmt=" ", label='Ground Truth')
+                ax.legend()
+
+                def update(frame):
+                    x = all_particles[frame].ravel()
+                    y = self.dual_certificate(x)
+                    scatter.set_offsets(np.c_[x, y])
+                    return scatter,
+
+                # Create and save the animation
+                ani = animation.FuncAnimation(fig, update, frames=n_iterations, blit=True)
+                writer = animation.PillowWriter(fps=200,
+                                                metadata=dict(artist='Me'),
+                                                bitrate=1800)
+                ani.save(f'gradient_descent_{self._astate["idx"]}.gif', writer=writer)
+
+        def BFGSascent():
+            # res = []
+            # for xinit in mst['particles']:
+            #     opti = minimize(lambda x: -1. * dual_cert.apply(x)[0], xinit, method="BFGS",
+            #                     jac=lambda x : -1. * dual_cert.grad(x).ravel())
+            #     xout = opti.x
+            #     res.append(xout)
+            # mst['particles'] = np.array(res)
+            def f(xinit):
+                opti = minimize(lambda x: -1. * dual_cert.apply(x)[0], xinit, method="BFGS",
+                                jac=lambda x: -1. * dual_cert.grad(x).ravel(), tol=1e-5)
+                xout = opti.x
+                return xout
+
+            with parallel_backend('threading'):
+                output_par = Parallel(n_jobs=-1)(
+                    delayed(f)(xinit) for xinit in mst["particles"]
+                )
+            mst['particles'] = np.array(output_par)
+
+        # Gascent()
+        BFGSascent()
+
+        # make sure the particles live within the bounds
+        # if self.x_dim == 1:
+        #     valid_particles = (self.bounds[0] <= mst['particles']) & (mst['particles'] <= self.bounds[1])
+        # elif self.x_dim == 2:
+        #     valid_particles = np.all((self.bounds[0] <= mst['particles']) & (mst['particles'] <= self.bounds[1]), axis=1)
+        # else:
+        #     raise ValueError("Only 1D and 2D signals are supported.")
+        # mst["particles"] = mst["particles"][valid_particles]
+
+        valid_particles = np.all((self.bounds[0] <= mst['particles']) & (mst['particles'] <= self.bounds[1]), axis=1)
+        mst["particles"] = mst["particles"][valid_particles]
 
         if self.initialization == "smoothing":
             mst['best_positions'] = mst['particles']
@@ -287,39 +380,6 @@ class FW(pxs.Solver):
         global_best_index = np.argmax(mst['best_costs'])
         mst['global_best_position'] = mst['best_positions'][global_best_index].copy().reshape(-1, self.x_dim)
         mst['global_best_cost'] = mst['best_costs'][global_best_index]
-
-        # Animation of the gradient descent
-        if self._astate["idx"] == 1 and self.animation:
-            import matplotlib.animation as animation
-
-            n_iterations = len(all_particles)
-            fig, ax = plt.subplots()
-
-            x = np.linspace(self.bounds[0], self.bounds[1], 2048)
-            y = self.dual_certificate(x)
-            plt.plot(x, y, label='Empirical Dual Certificate', color='blue')
-
-            # Initialize the plot with the first point
-            xdata = all_particles[0].ravel()
-            ydata = self.dual_certificate(xdata)
-            scatter = ax.scatter(xdata, ydata, label='Gradient Steps')
-            x0 = np.array([0.2, 0.5, 0.8])
-            a0 = np.array([1, 2, 1.5])
-            ax.stem(x0, a0, linefmt='k.--', markerfmt='ko', basefmt=" ", label='Ground Truth')
-            ax.legend()
-
-            def update(frame):
-                x = all_particles[frame].ravel()
-                y = self.dual_certificate(x)
-                scatter.set_offsets(np.c_[x, y])
-                return scatter,
-
-            # Create and save the animation
-            ani = animation.FuncAnimation(fig, update, frames=n_iterations, blit=True)
-            writer = animation.PillowWriter(fps=200,
-                                            metadata=dict(artist='Me'),
-                                            bitrate=1800)
-            ani.save(f'gradient_descent_{self._astate["idx"]}.gif', writer=writer)
 
     def correction_step(self) -> pxt.NDArray:
         """
@@ -366,8 +426,9 @@ class FW(pxs.Solver):
         apgd = PGD(data_fid, self.lambda_ * penalty, show_progress=False)
 
         min_iter = pxos.MaxIter(n=10)
+        max_iter = pxos.MaxIter(n=self.correction_max_iter)
 
-        stop = (min_iter & correction_stop_crit(1e-4))
+        stop = (min_iter & correction_stop_crit(self.correction_eps)) | max_iter
 
         apgd.fit(
             x0=a0,
@@ -399,7 +460,21 @@ class FW(pxs.Solver):
             x = forward_op.adjoint(forward_op(x))
             x = x / np.linalg.norm(x)
         data_fid.diff_lipschitz = np.linalg.norm(forward_op.adjoint(forward_op(x))) / np.linalg.norm(x)
+        # data_fid.diff_lipschitz = data_fid.estimate_diff_lipschitz(method="svd", tol=1e-1)
+
         return data_fid
+
+    def blasso_objective_val(self) -> pxt.NDArray:
+        """
+        Compute the objective value of the LASSO problem.
+        """
+        mst = self._mstate
+        x = mst["x"]
+        a = mst["a"]
+        y = self.y
+        forward_op = self.forward_op.get_new_operator(x)
+        data_fid = 0.5 * pxop.SquaredL2Norm(dim_shape=y.shape).argshift(-y) * forward_op
+        return data_fid(a) + self.lambda_ * np.linalg.norm(a, 1)
 
     def m_step(self):
         # Find a list of dirac positions candidates
@@ -414,7 +489,7 @@ class FW(pxs.Solver):
         mst["candidates_search_durations"].append(t2 - t1)
 
         # Remove candidates with small dual certificate values.
-        filter = mst['best_costs'] > 0.9
+        filter = mst['best_costs'] > 0.95
         if np.any(filter):
             mst['best_positions'] = mst['best_positions'][filter]
             mst['best_costs'] = mst['best_costs'][filter]
@@ -585,8 +660,9 @@ class FW(pxs.Solver):
 
     def default_stop_crit(self) -> StoppingCriterion:
         """Set the stopping criterion of the algorithm."""
-        stop_crit = StopDualCertificate(self.y, self.forward_op, self.lambda_, self.bounds, self.x_dim,
-                                        self.dual_certificate_tol, self.positive_constraint)
+        # stop_crit = StopDualCertificate(self.y, self.forward_op, self.lambda_, self.bounds, self.x_dim,
+        #                                 self.dual_certificate_tol, self.positive_constraint)
+        stop_crit = LastStepCertificateStop(self.dual_certificate_tol)
         return (stop_crit & pxos.MaxIter(self.min_iter)) | pxos.MaxIter(self.max_iter)
 
     def objective_func(self) -> pxt.NDArray:
@@ -931,8 +1007,8 @@ class StopDualCertificate(StoppingCriterion):
         if x_dim == 1:
             self.grid = np.linspace(bounds[0], bounds[1], 2048)
         elif x_dim == 2:
-            grid1 = np.linspace(bounds[0], bounds[1], 32)[1:-1]
-            grid2 = np.linspace(bounds[0], bounds[1], 32)[1:-1]
+            grid1 = np.linspace(bounds[0], bounds[1], 64)[1:-1]
+            grid2 = np.linspace(bounds[0], bounds[1], 64)[1:-1]
             xx, yy = np.meshgrid(grid1, grid2)
             self.grid = np.stack([xx.ravel(), yy.ravel()], axis=1)
         else:
@@ -952,12 +1028,31 @@ class StopDualCertificate(StoppingCriterion):
         if len(state["dual_certificate"]) == 0:
             converged = False
         else:
-            converged = np.isclose(self._val, state["dual_certificate"][-1], atol=self.dual_certificate_tol).item() \
+            converged = np.isclose(self._val, state["dual_certificate"][-1], atol=self.dual_certificate_tol**2).item() \
                         and self._val < 1.1
 
         state["dual_certificate"].append(self._val)
         close = np.isclose(self._val, 1, atol=self.dual_certificate_tol).item()
         return close or converged
+        # return close
 
     def info(self) -> cabc.Mapping[str, float]:
         return {"Dual Certificate max value": self._val}
+
+
+# def previousStepDualCertStop(atol) -> pxos.AbsError:
+#     stop = pxos.AbsError(atol, "global_best_cost")
+#     return stop
+
+class LastStepCertificateStop(pxos.AbsError):
+    def __init__(self, atol: float):
+        self._certif = np.inf
+        super().__init__(atol, var="global_best_cost", f=lambda x : np.r_[np.abs(x) - 1])
+
+    def stop(self, state: cabc.Mapping[str]) -> bool:
+        state["dual_certificate"].append(state["global_best_cost"])
+        self._certif = state["global_best_cost"]
+        return super().stop(state)
+
+    def info(self) -> cabc.Mapping[str, float]:
+        return {"Dual Certificate max value": self._certif}
